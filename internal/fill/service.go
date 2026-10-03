@@ -9,10 +9,19 @@ import (
 	"github.com/wyw14/cry-98/internal/model"
 )
 
+// AutomaticDemandSink accepts refill demands raised by low level
+// probes instead of starting a fill immediately. The persisted demand
+// queue (internal/fillrequest) satisfies this interface; a nil sink
+// keeps the legacy direct-start behaviour.
+type AutomaticDemandSink interface {
+	SubmitAutomatic(vesselID string, liters float64) error
+}
+
 type Service struct {
 	coordinator   *Coordinator
 	completion    *CompletionService
 	abort         *AbortService
+	demands       AutomaticDemandSink
 	defaultLiters float64
 }
 
@@ -23,9 +32,25 @@ func NewService(coordinator *Coordinator, completion *CompletionService, abort *
 	return &Service{coordinator: coordinator, completion: completion, abort: abort, defaultLiters: defaultLiters}, nil
 }
 
-func (s *Service) OnLowLevel(ctx context.Context, vesselID string, observedAt time.Time) (model.FillSession, error) {
+// SetDemandQueue routes low level probe events through the persisted
+// demand queue. Without it, OnLowLevel falls back to starting a session
+// directly.
+func (s *Service) SetDemandQueue(sink AutomaticDemandSink) {
+	s.demands = sink
+}
+
+// OnLowLevel handles a low level probe reading. With a demand queue
+// configured it records a deduplicated demand and returns; the scheduler
+// starts the fill once a compatible circuit is free, so a busy circuit
+// no longer causes the request to vanish.
+func (s *Service) OnLowLevel(ctx context.Context, vesselID string, observedAt time.Time) error {
 	_ = observedAt
-	return s.coordinator.StartAutomatic(ctx, vesselID, s.defaultLiters)
+	_ = ctx
+	if s.demands != nil {
+		return s.demands.SubmitAutomatic(vesselID, s.defaultLiters)
+	}
+	_, err := s.coordinator.StartAutomatic(ctx, vesselID, s.defaultLiters)
+	return err
 }
 
 func (s *Service) StartManual(ctx context.Context, vesselID string, liters float64) (model.FillSession, error) {

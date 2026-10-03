@@ -12,6 +12,7 @@ import (
 	"github.com/wyw14/cry-98/internal/api"
 	"github.com/wyw14/cry-98/internal/circuit"
 	"github.com/wyw14/cry-98/internal/fill"
+	"github.com/wyw14/cry-98/internal/fillrequest"
 	"github.com/wyw14/cry-98/internal/journal"
 	"github.com/wyw14/cry-98/internal/model"
 	"github.com/wyw14/cry-98/internal/monitor"
@@ -25,10 +26,11 @@ import (
 )
 
 type runtime struct {
-	server       *http.Server
-	retryQueue   *notify.RetryQueue
-	dispatcher   *notify.Dispatcher
-	alarmService *alarm.Service
+	server          *http.Server
+	retryQueue      *notify.RetryQueue
+	dispatcher      *notify.Dispatcher
+	alarmService    *alarm.Service
+	demandScheduler *fillrequest.Scheduler
 }
 
 func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
@@ -161,9 +163,48 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Persisted refill demand queue. Probes enqueue demands here and the
+	// scheduler starts fills only when a zone-compatible circuit is free.
+	demandQueue, err := fillrequest.NewQueue(store, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := fillrequest.NewRecovery(store, demandQueue).Restore(); err != nil {
+		return nil, err
+	}
+	// Sessions are held only in memory, so after a restart none are
+	// live: return any dispatched demands to the queue for rescheduling.
+	liveSessions := make(map[string]bool)
+	for _, session := range fillCoordinator.List() {
+		if session.Active() {
+			liveSessions[session.ID.String()] = true
+		}
+	}
+	if requeued, err := demandQueue.RequeueDispatched(liveSessions); err != nil {
+		return nil, err
+	} else if requeued > 0 {
+		slog.Warn("requeued refill demands after restart", "count", requeued)
+	}
+	matcher := fillrequest.NewZoneCircuitMatcher(vesselRegistry, circuitRegistry, circuitManager)
+	demandScheduler, err := fillrequest.NewScheduler(demandQueue, &fillStarterAdapter{
+		coordinator: fillCoordinator,
+		aborts:      aborts,
+	}, matcher, now)
+	if err != nil {
+		return nil, err
+	}
+	fillService.SetDemandQueue(demandScheduler)
+	fillCoordinator.SetSessionFinalizer(func(session model.FillSession) {
+		completed := session.State == model.FillCompleted
+		_ = demandScheduler.OnSessionFinal(session.ID.String(), completed, session.Failure)
+	})
+
 	if err := ingestor.AddObserver(func(sample model.Sample) {
 		if sample.Kind == model.ProbeLevel && sample.Value < 20 {
-			_, _ = fillService.OnLowLevel(context.Background(), sample.VesselID, sample.ObservedAt)
+			if err := fillService.OnLowLevel(context.Background(), sample.VesselID, sample.ObservedAt); err != nil {
+				slog.Warn("refill demand rejected", "vessel", sample.VesselID, "error", err)
+			}
 		}
 	}); err != nil {
 		return nil, err
@@ -205,6 +246,7 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		Health:         healthService,
 		ProbeMonitor:   probeMonitor,
 		Suppressions:   suppressions,
+		Requests:       demandScheduler,
 		Now:            now,
 	})
 	server := &http.Server{
@@ -213,7 +255,13 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService}, nil
+	return &runtime{
+		server:          server,
+		retryQueue:      retryQueue,
+		dispatcher:      dispatcher,
+		alarmService:    alarmService,
+		demandScheduler: demandScheduler,
+	}, nil
 }
 
 func (r *runtime) run(ctx context.Context) error {
@@ -239,6 +287,7 @@ func (r *runtime) run(ctx context.Context) error {
 			if pending := len(r.retryQueue.Pending()); pending > 0 {
 				slog.Warn("alarm notifications awaiting retry", "count", pending)
 			}
+			r.demandScheduler.Dispatch(ctx)
 		}
 	}
 }

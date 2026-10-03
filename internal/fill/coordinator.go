@@ -16,6 +16,11 @@ import (
 
 var ErrActiveSession = errors.New("vessel already has an active fill session")
 
+// SessionFinalizer is invoked once when a fill session reaches a
+// terminal state (completed or failed). It lets consumers such as the
+// refill demand queue resolve the demand that started the session.
+type SessionFinalizer func(session model.FillSession)
+
 type Coordinator struct {
 	mu          sync.RWMutex
 	sessions    map[uuid.UUID]model.FillSession
@@ -25,12 +30,22 @@ type Coordinator struct {
 	routes      *valve.RouteService
 	retry       *RetryService
 	vessels     *vessel.StateService
+	finalizer   SessionFinalizer
 	now         func() time.Time
 }
 
 func (c *Coordinator) SetRetryService(retry *RetryService) {
 	c.mu.Lock()
 	c.retry = retry
+	c.mu.Unlock()
+}
+
+// SetSessionFinalizer registers the terminal-session callback. It must
+// be set before sessions are started. The callback runs while holding
+// no coordinator lock, so it must not call back into the coordinator.
+func (c *Coordinator) SetSessionFinalizer(finalizer SessionFinalizer) {
+	c.mu.Lock()
+	c.finalizer = finalizer
 	c.mu.Unlock()
 }
 
@@ -50,12 +65,26 @@ func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, ro
 }
 
 func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64) (model.FillSession, error) {
+	return c.start(ctx, vesselID, origin, liters, "")
+}
+
+// StartOnCircuit starts a fill pinned to a specific circuit. It is used
+// by the demand scheduler, which has already verified that the circuit
+// is compatible with the vessel's zone and currently free.
+func (c *Coordinator) StartOnCircuit(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64, circuitID string) (model.FillSession, error) {
+	if circuitID == "" {
+		return model.FillSession{}, errors.New("circuit id is required")
+	}
+	return c.start(ctx, vesselID, origin, liters, circuitID)
+}
+
+func (c *Coordinator) start(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64, preferredCircuit string) (model.FillSession, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.active[vesselID]; exists {
 		return model.FillSession{}, ErrActiveSession
 	}
-	selected, err := c.selectCircuit()
+	selected, err := c.selectCircuit(preferredCircuit)
 	if err != nil {
 		return model.FillSession{}, err
 	}
@@ -149,7 +178,20 @@ func (c *Coordinator) List() []model.FillSession {
 	return result
 }
 
-func (c *Coordinator) selectCircuit() (circuit.Circuit, error) {
+func (c *Coordinator) selectCircuit(preferred string) (circuit.Circuit, error) {
+	if preferred != "" {
+		selected, ok := c.circuitList.Get(preferred)
+		if !ok {
+			return circuit.Circuit{}, errors.New("circuit is not configured")
+		}
+		if !selected.Enabled {
+			return circuit.Circuit{}, errors.New("circuit is disabled")
+		}
+		if _, occupied := c.circuits.Get(preferred); occupied {
+			return circuit.Circuit{}, circuit.ErrCircuitBusy
+		}
+		return selected, nil
+	}
 	for _, candidate := range c.circuitList.List() {
 		if !candidate.Enabled {
 			continue
@@ -164,4 +206,10 @@ func (c *Coordinator) selectCircuit() (circuit.Circuit, error) {
 func (c *Coordinator) finishState(session model.FillSession) {
 	c.sessions[session.ID] = session
 	delete(c.active, session.VesselID)
+	if c.finalizer != nil {
+		// Callers hold c.mu here. The finalizer resolves the demand in
+		// the separate fillrequest queue, which never takes c.mu, so
+		// there is no lock-ordering cycle.
+		c.finalizer(session)
+	}
 }

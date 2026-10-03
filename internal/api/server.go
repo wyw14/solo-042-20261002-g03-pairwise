@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/wyw14/cry-98/internal/alarm"
 	"github.com/wyw14/cry-98/internal/fill"
+	"github.com/wyw14/cry-98/internal/fillrequest"
 	"github.com/wyw14/cry-98/internal/monitor"
 	"github.com/wyw14/cry-98/internal/probe"
 	"github.com/wyw14/cry-98/internal/telemetry"
@@ -26,6 +27,7 @@ type Dependencies struct {
 	Health         *monitor.HealthService
 	ProbeMonitor   *monitor.ProbeMonitor
 	Suppressions   *alarm.SuppressionService
+	Requests       *fillrequest.Scheduler
 	Now            func() time.Time
 }
 
@@ -61,6 +63,9 @@ func (s *Server) routes() chi.Router {
 		api.Post("/fill-sessions/{id}/complete", s.completeFill)
 		api.Post("/fill-sessions/{id}/abort", s.abortFill)
 		api.Post("/fill-sessions/{id}/recover-isolation", s.recoverFillIsolation)
+		api.Get("/fill-requests", s.listFillRequests)
+		api.Post("/fill-requests", s.submitFillRequest)
+		api.Post("/fill-requests/{vesselID}/cancel", s.cancelFillRequest)
 		api.Get("/alarms", s.listAlarms)
 		api.Post("/alarms", s.raiseAlarm)
 		api.Post("/alarms/{id}/acknowledge", s.acknowledgeAlarm)

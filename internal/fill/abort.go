@@ -61,7 +61,9 @@ func (s *AbortService) RecoverIsolation(sessionID uuid.UUID) error {
 	if err := s.coordinator.circuits.Recover(session.CircuitID, session.ID); err != nil {
 		return err
 	}
-	delete(s.coordinator.active, session.VesselID)
+	// finishState removes the active reservation and resolves any
+	// linked demand; a faulted session never fulfilled its request.
+	s.coordinator.finishState(session)
 	_, err := s.coordinator.vessels.FinishFill(session.VesselID)
 	return err
 }
