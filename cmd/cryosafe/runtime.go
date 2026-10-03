@@ -29,6 +29,7 @@ type runtime struct {
 	retryQueue   *notify.RetryQueue
 	dispatcher   *notify.Dispatcher
 	alarmService *alarm.Service
+	fillService  *fill.Service
 }
 
 func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
@@ -155,15 +156,25 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		return nil, err
 	}
 	fillCoordinator.SetRetryService(retryService)
+	demandQueue, err := fill.NewDemandQueue(fillCoordinator, store, fill.DefaultSchedulingPolicy(), now)
+	if err != nil {
+		return nil, err
+	}
+	if err := fill.NewDemandRecovery(store, demandQueue).Restore(); err != nil {
+		return nil, err
+	}
 	completion := fill.NewCompletionService(fillCoordinator, pressureMonitor, store, now)
 	aborts := fill.NewAbortService(fillCoordinator, now)
-	fillService, err := fill.NewService(fillCoordinator, completion, aborts, 2.1)
+	demandQueue.SetAbortService(aborts)
+	fillService, err := fill.NewService(fillCoordinator, completion, aborts, demandQueue, 2.1)
 	if err != nil {
 		return nil, err
 	}
 	if err := ingestor.AddObserver(func(sample model.Sample) {
 		if sample.Kind == model.ProbeLevel && sample.Value < 20 {
-			_, _ = fillService.OnLowLevel(context.Background(), sample.VesselID, sample.ObservedAt)
+			if _, err := fillService.OnLowLevel(context.Background(), sample.VesselID, sample.Value, sample.ObservedAt); err != nil {
+				slog.Warn("low-level demand rejected", "vessel", sample.VesselID, "error", err)
+			}
 		}
 	}); err != nil {
 		return nil, err
@@ -213,7 +224,13 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &runtime{server: server, retryQueue: retryQueue, dispatcher: dispatcher, alarmService: alarmService}, nil
+	return &runtime{
+		server:       server,
+		retryQueue:   retryQueue,
+		dispatcher:   dispatcher,
+		alarmService: alarmService,
+		fillService:  fillService,
+	}, nil
 }
 
 func (r *runtime) run(ctx context.Context) error {
@@ -223,6 +240,16 @@ func (r *runtime) run(ctx context.Context) error {
 	}()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	wake := r.fillService.Demands().Wake()
+	dispatch := func() {
+		results := r.fillService.Dispatch(ctx)
+		for _, result := range results {
+			if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
+				slog.Warn("fill demand not dispatched", "vessel", result.Demand.VesselID, "error", result.Err)
+			}
+		}
+	}
+	dispatch()
 	for {
 		select {
 		case <-ctx.Done():
@@ -239,6 +266,9 @@ func (r *runtime) run(ctx context.Context) error {
 			if pending := len(r.retryQueue.Pending()); pending > 0 {
 				slog.Warn("alarm notifications awaiting retry", "count", pending)
 			}
+			dispatch()
+		case <-wake:
+			dispatch()
 		}
 	}
 }

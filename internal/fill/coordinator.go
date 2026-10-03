@@ -16,6 +16,11 @@ import (
 
 var ErrActiveSession = errors.New("vessel already has an active fill session")
 
+// ReleaseHook is invoked after a fill session releases its circuit (outside
+// the coordinator lock). succeeded distinguishes a completed fill from one
+// that was aborted or had its isolation recovered.
+type ReleaseHook func(sessionID uuid.UUID, vesselID string, succeeded bool, reason string)
+
 type Coordinator struct {
 	mu          sync.RWMutex
 	sessions    map[uuid.UUID]model.FillSession
@@ -25,12 +30,19 @@ type Coordinator struct {
 	routes      *valve.RouteService
 	retry       *RetryService
 	vessels     *vessel.StateService
+	releaseHook ReleaseHook
 	now         func() time.Time
 }
 
 func (c *Coordinator) SetRetryService(retry *RetryService) {
 	c.mu.Lock()
 	c.retry = retry
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) SetReleaseHook(hook ReleaseHook) {
+	c.mu.Lock()
+	c.releaseHook = hook
 	c.mu.Unlock()
 }
 
@@ -52,6 +64,10 @@ func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, ro
 func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64) (model.FillSession, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.startLocked(ctx, vesselID, origin, liters)
+}
+
+func (c *Coordinator) startLocked(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64) (model.FillSession, error) {
 	if _, exists := c.active[vesselID]; exists {
 		return model.FillSession{}, ErrActiveSession
 	}
@@ -114,6 +130,44 @@ func (c *Coordinator) StartAutomatic(ctx context.Context, vesselID string, liter
 
 func (c *Coordinator) StartManual(ctx context.Context, vesselID string, liters float64) (model.FillSession, error) {
 	return c.Start(ctx, vesselID, model.FillManual, liters)
+}
+
+// StartForDemand starts a session on behalf of a queued demand. It behaves
+// like Start but is named explicitly so callers cannot bypass the queue
+// machinery for automatic fills by accident.
+func (c *Coordinator) StartForDemand(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64) (model.FillSession, error) {
+	return c.Start(ctx, vesselID, origin, liters)
+}
+
+// HasActiveSession reports whether the vessel currently owns an active fill
+// session. The guard is advisory for scheduling; Start enforces it under the
+// coordinator lock, which is what prevents a valve route being opened twice.
+func (c *Coordinator) HasActiveSession(vesselID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, exists := c.active[vesselID]
+	return exists
+}
+
+// AvailableCircuit returns one enabled, unreserved circuit.
+func (c *Coordinator) AvailableCircuit() (circuit.Circuit, bool) {
+	selected, err := c.selectCircuit()
+	if err != nil {
+		return circuit.Circuit{}, false
+	}
+	return selected, true
+}
+
+// notifyReleased invokes the release hook. It must be called outside the
+// coordinator lock because the hook drives demand bookkeeping and may start
+// new work back through the coordinator.
+func (c *Coordinator) notifyReleased(session model.FillSession, succeeded bool, reason string) {
+	c.mu.RLock()
+	hook := c.releaseHook
+	c.mu.RUnlock()
+	if hook != nil {
+		hook(session.ID, session.VesselID, succeeded, reason)
+	}
 }
 
 func (c *Coordinator) BeginSoak(sessionID uuid.UUID) (model.FillSession, error) {

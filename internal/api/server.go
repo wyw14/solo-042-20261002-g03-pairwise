@@ -61,6 +61,8 @@ func (s *Server) routes() chi.Router {
 		api.Post("/fill-sessions/{id}/complete", s.completeFill)
 		api.Post("/fill-sessions/{id}/abort", s.abortFill)
 		api.Post("/fill-sessions/{id}/recover-isolation", s.recoverFillIsolation)
+		api.Get("/fill-demands", s.listFillDemands)
+		api.Post("/fill-demands/{id}/cancel", s.cancelFillDemand)
 		api.Get("/alarms", s.listAlarms)
 		api.Post("/alarms", s.raiseAlarm)
 		api.Post("/alarms/{id}/acknowledge", s.acknowledgeAlarm)
